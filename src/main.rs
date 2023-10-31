@@ -13,6 +13,9 @@ struct Args {
 
     #[clap(short, long)]
     user: Option<String>,
+
+    #[clap(short, long)]
+    halloween: bool,
 }
 
 fn main() -> Result<()> {
@@ -23,7 +26,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(user) = args.user {
-        return kinderdisco(user);
+        return kinderdisco(user, args.halloween);
     }
 
     println!("Usage: \"kinderdisco --user $USER\" or \"kinderdisco --register-user\"");
@@ -52,24 +55,43 @@ fn get_color_lights(bridge: &bridge::Bridge) -> Result<Vec<Light>> {
         .collect())
 }
 
-async fn modify_light(light: Light, bridge: &Bridge) {
+async fn modify_light(light: Light, bridge: &Bridge, halloween: bool) {
     loop {
         let mut rng = rand::thread_rng();
-        let modifier = StateModifier::new()
-            .with_on(true)
-            .with_color(Color::from_rgb(rng.gen(), rng.gen(), rng.gen()));
+        let (modifier, time) = if halloween {
+            let transition = rng.gen_range(9..90);
+            (
+                StateModifier::new()
+                    .with_on(true)
+                    .with_color(Color::from_rgb(
+                        rng.gen_range(240..255),
+                        rng.gen_range(25..170),
+                        rng.gen_range(0..50),
+                    ))
+                    .with_transition_time(transition),
+                transition,
+            )
+        } else {
+            (
+                StateModifier::new()
+                    .with_on(true)
+                    .with_color(Color::from_rgb(rng.gen(), rng.gen(), rng.gen()))
+                    .with_transition_time(0),
+                rng.gen_range(3..30),
+            )
+        };
         _ = bridge.set_light_state(&light.id, &modifier);
-        task::sleep(Duration::from_millis(rng.gen_range(300..3000))).await;
+        task::sleep(Duration::from_millis(time as u64 * 100)).await;
     }
 }
 
-async fn modify_color_lights(user: String) -> Result<()> {
+async fn modify_color_lights(user: String, halloween: bool) -> Result<()> {
     let ip = get_bridge_ip()?;
     let bridge = Arc::new(Bridge::new(ip, user));
 
     let lights = get_color_lights(&bridge)?
         .drain(..)
-        .map(|light| modify_light(light, &bridge))
+        .map(|light| modify_light(light, &bridge, halloween))
         .collect::<Vec<_>>();
     future::join_all(lights).await;
     Ok(())
@@ -82,8 +104,8 @@ async fn wait_for_key_press() -> Result<()> {
     Ok(())
 }
 
-fn kinderdisco(user: String) -> Result<()> {
-    let lights = modify_color_lights(user).fuse();
+fn kinderdisco(user: String, halloween: bool) -> Result<()> {
+    let lights = modify_color_lights(user, halloween).fuse();
     pin_mut!(lights);
 
     let key_press = wait_for_key_press().fuse();
