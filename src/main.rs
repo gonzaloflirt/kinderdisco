@@ -93,7 +93,7 @@ fn kinderdisco(user: String) -> Result<()> {
 
     async_std::task::block_on(async move {
         futures::select! {
-            _ = lights => (),
+            r = lights => {  if r.is_err() { println!("ERROR: {:?}", r)}; },
             _ = key_press => (),
         };
     });
