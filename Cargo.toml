@@ -9,6 +9,8 @@ edition = "2021"
 anyhow = "1.0"
 async-std = "1.10.0"
 clap = { version = "4.4.7", features = ["derive"] }
+confy = "0.5.1"
 futures = "0.3.21"
 huelib = "0.13.2"
 rand = "0.8.5"
+serde = "1.0"

@@ -4,7 +4,15 @@ use clap::Parser;
 use futures::{future, pin_mut, FutureExt};
 use huelib::{bridge, bridge::Bridge, resource::light::StateModifier, resource::Light, Color};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::{net::IpAddr, sync::Arc, time::Duration};
+
+static APP_NAME: &str = "kinderdisco";
+
+#[derive(Serialize, Deserialize, Default)]
+struct Config {
+    user: Option<String>,
+}
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -28,6 +36,10 @@ fn main() -> Result<()> {
     if let Some(user) = args.user {
         return kinderdisco(user, args.halloween);
     }
+    let config = confy::load::<Config>(APP_NAME, None)?;
+    if let Some(user) = config.user {
+        return kinderdisco(user, args.halloween);
+    }
 
     println!("Usage: \"kinderdisco --user $USER\" or \"kinderdisco --register-user\"");
 
@@ -42,8 +54,13 @@ fn get_bridge_ip() -> Result<IpAddr> {
 
 fn register_user() -> Result<()> {
     let ip = get_bridge_ip()?;
-    let username = bridge::register_user(ip, "kinderdisco")?;
-    println!("Registered user with username `{}`", username);
+    let user = bridge::register_user(ip, "kinderdisco")?;
+    println!("Registered user with username `{}`", user);
+
+    let config = Config { user: Some(user) };
+    confy::store(APP_NAME, None, config)?;
+    println!("Stored username.");
+
     Ok(())
 }
 
