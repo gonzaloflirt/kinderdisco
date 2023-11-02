@@ -1,141 +1,158 @@
-use anyhow::{anyhow, Result};
-use async_std::{io, task};
-use clap::Parser;
-use futures::{future, pin_mut, FutureExt};
-use huelib::{bridge, bridge::Bridge, resource::light::StateModifier, resource::Light, Color};
-use rand::Rng;
-use serde::{Deserialize, Serialize};
-use std::{net::IpAddr, sync::Arc, time::Duration};
+mod app;
 
-static APP_NAME: &str = "kinderdisco";
-
-#[derive(Serialize, Deserialize, Default)]
-struct Config {
-    user: Option<String>,
+fn main() {
+    let native_options = eframe::NativeOptions {
+        initial_window_size: Some([400.0, 300.0].into()),
+        min_window_size: Some([300.0, 220.0].into()),
+        ..Default::default()
+    };
+    let _ = eframe::run_native(
+        "kinderdisco",
+        native_options,
+        Box::new(|cc| {
+            let mut app = Box::new(App::new(cc));
+            app.get_bridge_ip();
+            app
+        }),
+    );
 }
 
-#[derive(Parser, Debug)]
-struct Args {
-    #[clap(short, long)]
-    register_user: bool,
+use crate::app::App;
 
-    #[clap(short, long)]
-    user: Option<String>,
-
-    #[clap(long)]
-    halloween: bool,
+fn update_start<T>(range: &mut core::ops::Range<T>)
+where
+    T: Ord + Copy,
+{
+    range.start = std::cmp::min(range.start, range.end)
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+fn update_end<T>(range: &mut core::ops::Range<T>)
+where
+    T: Ord + Copy,
+{
+    range.end = std::cmp::max(range.start, range.end)
+}
 
-    if args.register_user {
-        return register_user();
+impl App {
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        Default::default()
     }
 
-    if let Some(user) = args.user {
-        return kinderdisco(user, args.halloween);
+    fn draw_not_connected(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add(egui::Label::new("No Hue Bridge found."));
+            if ui.add(egui::Button::new("Search Bridge")).clicked() {
+                self.get_bridge_ip();
+            }
+            if let Some(error) = &self.error {
+                ui.add(egui::Label::new(error));
+            }
+        });
     }
-    let config = confy::load::<Config>(APP_NAME, None)?;
-    if let Some(user) = config.user {
-        return kinderdisco(user, args.halloween);
+
+    fn draw_register(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add(egui::Label::new(
+                "Press the button on the bridge to register.",
+            ));
+            if ui.add(egui::Button::new("Register user")).clicked() {
+                self.register_user(self.ip.unwrap());
+            }
+            if let Some(error) = &self.error {
+                ui.add(egui::Label::new(error));
+            }
+        });
     }
 
-    println!("Usage: \"kinderdisco --user $USER\" or \"kinderdisco --register-user\"");
+    fn draw_connected(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let lights = &mut self.lights;
+            for light in lights.values_mut() {
+                if ui
+                    .add(egui::Checkbox::new(&mut light.on, light.light.name.clone()))
+                    .changed()
+                {
+                    if light.on {
+                        let bridge = self.bridge.clone();
+                        if let Some(bridge) = bridge {
+                            light.start(bridge, self.async_data.clone());
+                        }
+                    } else {
+                        light.stop();
+                    }
+                }
+            }
 
-    Ok(())
+            ui.add(egui::Separator::default());
+
+            if ui
+                .add(egui::Slider::new(&mut self.data.r.start, 0..=255).text("r min"))
+                .changed()
+            {
+                update_end(&mut self.data.r)
+            }
+            if ui
+                .add(egui::Slider::new(&mut self.data.r.end, 0..=255).text("r max"))
+                .changed()
+            {
+                update_start(&mut self.data.r)
+            }
+
+            if ui
+                .add(egui::Slider::new(&mut self.data.g.start, 0..=255).text("g min"))
+                .changed()
+            {
+                update_end(&mut self.data.g)
+            }
+            if ui
+                .add(egui::Slider::new(&mut self.data.g.end, 0..=255).text("g max"))
+                .changed()
+            {
+                update_start(&mut self.data.g)
+            }
+
+            if ui
+                .add(egui::Slider::new(&mut self.data.b.start, 0..=255).text("b min"))
+                .changed()
+            {
+                update_end(&mut self.data.b)
+            }
+            if ui
+                .add(egui::Slider::new(&mut self.data.b.end, 0..=255).text("b max"))
+                .changed()
+            {
+                update_start(&mut self.data.b)
+            }
+            ui.add(egui::Separator::default());
+            if ui
+                .add(egui::Slider::new(&mut self.data.time.start, 1..=100).text("time (100ms) min"))
+                .changed()
+            {
+                update_end(&mut self.data.time)
+            }
+            if ui
+                .add(egui::Slider::new(&mut self.data.time.end, 1..=100).text("time (100ms) max"))
+                .changed()
+            {
+                update_start(&mut self.data.time)
+            }
+            ui.add(egui::Checkbox::new(&mut self.data.fade, "fade"))
+        });
+    }
 }
 
-fn get_bridge_ip() -> Result<IpAddr> {
-    bridge::discover_nupnp()?
-        .pop()
-        .ok_or_else(|| anyhow!("No hue bridge found."))
-}
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.poll();
 
-fn register_user() -> Result<()> {
-    let ip = get_bridge_ip()?;
-    let user = bridge::register_user(ip, "kinderdisco")?;
-    println!("Registered user with username `{}`", user);
-
-    let config = Config { user: Some(user) };
-    confy::store(APP_NAME, None, config)?;
-    println!("Stored username.");
-
-    Ok(())
-}
-
-fn get_color_lights(bridge: &bridge::Bridge) -> Result<Vec<Light>> {
-    Ok(bridge
-        .get_all_lights()?
-        .drain(..)
-        .filter(|light| light.kind == "Extended color light")
-        .collect())
-}
-
-async fn modify_light(light: Light, bridge: &Bridge, halloween: bool) {
-    loop {
-        let mut rng = rand::thread_rng();
-        let (modifier, time) = if halloween {
-            let transition = rng.gen_range(9..90);
-            (
-                StateModifier::new()
-                    .with_on(true)
-                    .with_color(Color::from_rgb(
-                        rng.gen_range(240..255),
-                        rng.gen_range(25..170),
-                        rng.gen_range(0..50),
-                    ))
-                    .with_transition_time(transition),
-                transition,
-            )
+        if self.bridge.is_some() {
+            self.draw_connected(ctx, frame);
+        } else if self.ip.is_some() {
+            self.draw_register(ctx, frame);
         } else {
-            (
-                StateModifier::new()
-                    .with_on(true)
-                    .with_color(Color::from_rgb(rng.gen(), rng.gen(), rng.gen()))
-                    .with_transition_time(0),
-                rng.gen_range(3..30),
-            )
-        };
-        _ = bridge.set_light_state(&light.id, &modifier);
-        task::sleep(Duration::from_millis(time as u64 * 100)).await;
+            self.draw_not_connected(ctx, frame);
+        }
+
+        self.update_data();
     }
-}
-
-async fn modify_color_lights(user: String, halloween: bool) -> Result<()> {
-    let ip = get_bridge_ip()?;
-    let bridge = Arc::new(Bridge::new(ip, user));
-
-    let lights = get_color_lights(&bridge)?
-        .drain(..)
-        .map(|light| modify_light(light, &bridge, halloween))
-        .collect::<Vec<_>>();
-    future::join_all(lights).await;
-    Ok(())
-}
-
-async fn wait_for_key_press() -> Result<()> {
-    let stdin = io::stdin();
-    let mut line = String::new();
-    stdin.read_line(&mut line).await?;
-    Ok(())
-}
-
-fn kinderdisco(user: String, halloween: bool) -> Result<()> {
-    let lights = modify_color_lights(user, halloween).fuse();
-    pin_mut!(lights);
-
-    let key_press = wait_for_key_press().fuse();
-    pin_mut!(key_press);
-
-    println!("Press a key to quit!");
-
-    async_std::task::block_on(async move {
-        futures::select! {
-            r = lights => {  if r.is_err() { println!("ERROR: {:?}", r)}; },
-            _ = key_press => (),
-        };
-    });
-
-    Ok(())
 }
