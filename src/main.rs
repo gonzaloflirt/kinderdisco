@@ -1,9 +1,13 @@
 mod app;
 
+use crate::app::App;
+use app::SyncMode;
+
 fn main() {
     let native_options = eframe::NativeOptions {
-        initial_window_size: Some([400.0, 300.0].into()),
-        min_window_size: Some([300.0, 220.0].into()),
+        initial_window_size: Some([400.0, 340.0].into()),
+        min_window_size: Some([300.0, 200.0].into()),
+        follow_system_theme: true,
         ..Default::default()
     };
     let _ = eframe::run_native(
@@ -17,8 +21,6 @@ fn main() {
     );
 }
 
-use crate::app::App;
-
 fn update_start<T>(range: &mut core::ops::Range<T>)
 where
     T: Ord + Copy,
@@ -31,6 +33,14 @@ where
     T: Ord + Copy,
 {
     range.end = std::cmp::max(range.start, range.end)
+}
+
+fn label(sync_mode: SyncMode) -> &'static str {
+    match sync_mode {
+        SyncMode::None => "none",
+        SyncMode::Time => "time",
+        SyncMode::TimeAndColor => "time & color",
+    }
 }
 
 impl App {
@@ -66,25 +76,6 @@ impl App {
 
     fn draw_connected(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            let lights = &mut self.lights;
-            for light in lights.values_mut() {
-                if ui
-                    .add(egui::Checkbox::new(&mut light.on, light.light.name.clone()))
-                    .changed()
-                {
-                    if light.on {
-                        let bridge = self.bridge.clone();
-                        if let Some(bridge) = bridge {
-                            light.start(bridge, self.async_data.clone());
-                        }
-                    } else {
-                        light.stop();
-                    }
-                }
-            }
-
-            ui.add(egui::Separator::default());
-
             if ui
                 .add(egui::Slider::new(&mut self.data.r.start, 0..=255).text("r min"))
                 .changed()
@@ -136,7 +127,34 @@ impl App {
             {
                 update_start(&mut self.data.time)
             }
-            ui.add(egui::Checkbox::new(&mut self.data.fade, "fade"))
+            ui.add(egui::Checkbox::new(&mut self.data.fade, "fade"));
+
+            egui::ComboBox::from_label("sync mode")
+                .selected_text(label(self.sync_mode))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.sync_mode, SyncMode::None, label(SyncMode::None));
+                    ui.selectable_value(&mut self.sync_mode, SyncMode::Time, label(SyncMode::Time));
+                    ui.selectable_value(
+                        &mut self.sync_mode,
+                        SyncMode::TimeAndColor,
+                        label(SyncMode::TimeAndColor),
+                    );
+                });
+
+            ui.add(egui::Separator::default());
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for (_, light) in &mut self.lights {
+                    if ui
+                        .add(egui::Checkbox::new(&mut light.on, light.light.name.clone()))
+                        .changed()
+                    {
+                        self.rebuild_modulators = true;
+                    }
+                }
+
+                ui.allocate_space(ui.available_size());
+            });
         });
     }
 }

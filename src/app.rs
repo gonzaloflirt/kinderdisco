@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use async_std::task;
 use core::ops::Range;
-use futures::{pin_mut, FutureExt};
+use futures::{future::Either, pin_mut, FutureExt};
 use huelib::{bridge, bridge::Bridge, resource::light::StateModifier, resource::Light, Color};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,6 +13,12 @@ use std::{
 
 static APP_NAME: &str = "kinderdisco";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncMode {
+    None,
+    Time,
+    TimeAndColor,
+}
 #[derive(Clone)]
 pub struct Data {
     pub r: Range<u8>,
@@ -37,25 +43,107 @@ impl Default for Data {
 pub struct DiscoLight {
     pub light: Light,
     pub on: bool,
-    stop: Option<futures::channel::oneshot::Sender<()>>,
 }
 
 impl DiscoLight {
     pub fn new(light: Light) -> Self {
-        Self {
-            light,
-            on: false,
-            stop: None,
-        }
+        Self { light, on: false }
     }
+}
 
-    pub fn start(&mut self, bridge: Bridge, data: Arc<RwLock<Data>>) {
+fn rand_range<S, T>(rng: &mut S, range: &core::ops::Range<T>) -> T
+where
+    S: random::Source,
+    T: Copy
+        + num_traits::identities::Zero
+        + random::Value
+        + std::ops::Sub<Output = T>
+        + std::ops::Rem
+        + std::ops::Add<<T as std::ops::Rem>::Output, Output = T>,
+{
+    let span = range.end - range.start;
+    if span.is_zero() {
+        range.start
+    } else {
+        range.start + (rng.read::<T>() % span)
+    }
+}
+
+async fn modify_lights_same_color(bridge: Bridge, light_ids: Vec<String>, data: Arc<RwLock<Data>>) {
+    let mut rng = random::default(43);
+    loop {
+        let time;
+        {
+            let data = data.read().unwrap();
+            time = rand_range(&mut rng, &data.time);
+            let transition_time = if data.fade { time } else { 0 };
+            let modifier = StateModifier::new()
+                .with_on(true)
+                .with_color(Color::from_rgb(
+                    rand_range(&mut rng, &data.r),
+                    rand_range(&mut rng, &data.g),
+                    rand_range(&mut rng, &data.b),
+                ))
+                .with_transition_time(transition_time);
+            for light_id in &light_ids {
+                _ = bridge.set_light_state(light_id, &modifier);
+            }
+        }
+        task::sleep(Duration::from_millis(time as u64 * 100)).await;
+    }
+}
+
+async fn modify_lights_different_colors(
+    bridge: Bridge,
+    light_ids: Vec<String>,
+    data: Arc<RwLock<Data>>,
+) {
+    let mut rng = random::default(
+        light_ids
+            .first()
+            .unwrap_or(&42.to_string())
+            .parse::<u64>()
+            .unwrap_or(42),
+    );
+    loop {
+        let time;
+        {
+            let data = data.read().unwrap();
+            time = rand_range(&mut rng, &data.time);
+            let transition_time = if data.fade { time } else { 0 };
+            for light_id in &light_ids {
+                let modifier = StateModifier::new()
+                    .with_on(true)
+                    .with_color(Color::from_rgb(
+                        rand_range(&mut rng, &data.r),
+                        rand_range(&mut rng, &data.g),
+                        rand_range(&mut rng, &data.b),
+                    ))
+                    .with_transition_time(transition_time);
+                _ = bridge.set_light_state(light_id, &modifier);
+            }
+        }
+        task::sleep(Duration::from_millis(time as u64 * 100)).await;
+    }
+}
+struct Modulator(futures::channel::oneshot::Sender<()>);
+
+impl Modulator {
+    fn new(
+        sync_mode: SyncMode,
+        light_ids: Vec<String>,
+        bridge: Bridge,
+        data: Arc<RwLock<Data>>,
+    ) -> Self {
         let (sender, receiver) = futures::channel::oneshot::channel::<()>();
-        self.stop = Some(sender);
-        self.on = true;
-        let id = self.light.id.clone();
-        task::spawn(async {
-            let task = modify_light(bridge, id, data).fuse();
+        task::spawn(async move {
+            let task = match sync_mode {
+                SyncMode::TimeAndColor => {
+                    Either::Left(modify_lights_same_color(bridge, light_ids, data))
+                }
+                _ => Either::Right(modify_lights_different_colors(bridge, light_ids, data)),
+            };
+            let task = task.fuse();
             let receiver = receiver.fuse();
             pin_mut!(task);
             pin_mut!(receiver);
@@ -64,11 +152,7 @@ impl DiscoLight {
             _ = task => (),
             };
         });
-    }
-
-    pub fn stop(&mut self) {
-        self.on = false;
-        self.stop = None;
+        Self(sender)
     }
 }
 
@@ -88,6 +172,9 @@ pub struct App {
     channel: (mpsc::Sender<Signal>, mpsc::Receiver<Signal>),
     pub data: Data,
     pub async_data: Arc<RwLock<Data>>,
+    pub sync_mode: SyncMode,
+    modulators: Vec<Modulator>,
+    pub rebuild_modulators: bool,
 }
 
 impl Default for App {
@@ -101,6 +188,9 @@ impl Default for App {
             channel: mpsc::channel::<Signal>(),
             data: Data::default(),
             async_data: Arc::new(RwLock::new(Data::default())),
+            sync_mode: SyncMode::None,
+            modulators: vec![],
+            rebuild_modulators: false,
         }
     }
 }
@@ -183,8 +273,47 @@ impl App {
     }
 
     pub fn update_data(&mut self) {
-        let mut async_data = self.async_data.write().unwrap();
-        *async_data = self.data.clone();
+        {
+            let mut async_data = self.async_data.write().unwrap();
+            *async_data = self.data.clone();
+        }
+
+        if self.rebuild_modulators {
+            self.rebuild_modulators();
+            self.rebuild_modulators = false;
+        }
+    }
+
+    fn rebuild_modulators(&mut self) {
+        self.modulators.clear();
+        if let Some(bridge) = &self.bridge {
+            let mut lights = self
+                .lights
+                .iter()
+                .filter(|(_, light)| light.on)
+                .map(|light| light.1.light.id.clone())
+                .collect::<Vec<_>>();
+
+            self.modulators = match self.sync_mode {
+                SyncMode::None => lights
+                    .drain(..)
+                    .map(|l| {
+                        Modulator::new(
+                            SyncMode::None,
+                            vec![l],
+                            bridge.clone(),
+                            self.async_data.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                _ => vec![Modulator::new(
+                    self.sync_mode,
+                    lights,
+                    bridge.clone(),
+                    self.async_data.clone(),
+                )],
+            }
+        }
     }
 }
 
@@ -221,44 +350,4 @@ async fn get_color_lights(bridge: Bridge) -> Result<Vec<Light>> {
         .drain(..)
         .filter(|light| light.kind == "Extended color light")
         .collect())
-}
-
-fn rand_range<S, T>(rng: &mut S, range: &core::ops::Range<T>) -> T
-where
-    S: random::Source,
-    T: Copy
-        + num_traits::identities::Zero
-        + random::Value
-        + std::ops::Sub<Output = T>
-        + std::ops::Rem
-        + std::ops::Add<<T as std::ops::Rem>::Output, Output = T>,
-{
-    let span = range.end - range.start;
-    if span.is_zero() {
-        range.start
-    } else {
-        range.start + (rng.read::<T>() % span)
-    }
-}
-
-async fn modify_light(bridge: Bridge, light_id: String, data: Arc<RwLock<Data>>) {
-    let mut rng = random::default(43);
-    loop {
-        let time;
-        {
-            let data = data.read().unwrap();
-            time = rand_range(&mut rng, &data.time);
-            let transition_time = if data.fade { time } else { 0 };
-            let modifier = StateModifier::new()
-                .with_on(true)
-                .with_color(Color::from_rgb(
-                    rand_range(&mut rng, &data.r),
-                    rand_range(&mut rng, &data.g),
-                    rand_range(&mut rng, &data.b),
-                ))
-                .with_transition_time(transition_time);
-            _ = bridge.set_light_state(&light_id, &modifier);
-        }
-        task::sleep(Duration::from_millis(time as u64 * 100)).await;
-    }
 }
